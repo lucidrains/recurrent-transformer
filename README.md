@@ -1,2 +1,3 @@
-# recurrent-transformer
+# recurrent-transformer (wip)
+
 Explorations into the Recurrent Transformer proposed by Costin-Andrei Oncescu et al. of Harvard University
