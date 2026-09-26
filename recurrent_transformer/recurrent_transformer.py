@@ -2,7 +2,7 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn
+from torch import nn, Tensor, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, RMSNorm, Linear, Sequential
 
@@ -78,16 +78,23 @@ class Attention(Module):
 
         # attention gating - Jumper et al. AF2
 
-        self.attn_gate = LoRA(dim, dim_inner) if attn_gate else None
+        self.attn_gate = LoRA(dim, dim_inner, low_rank = gate_low_rank) if attn_gate else None
 
         # value mlp - post project but before aggregation + residual - shown to work well in a iclr 2026 paper for image restoration and apt for this setting
 
-        self.value_mlp = MLP(dim_head, int(dim_head * value_mlp_expansion), dim_head)
+        self.value_mlp = MLP(dim_head, int(dim_head * value_mlp_expansion), dim_head) if use_value_mlp else None
 
     def forward(
         self,
-        tokens
+        tokens,
+        memory: tuple[Tensor, Tensor] | None = None,
+        return_memory = False,
+        return_recurr_memory = False
     ):
+        device = tokens.device
+
+        residual = tokens
+
         tokens = self.norm(tokens)
 
         q = self.to_queries(tokens)
@@ -105,9 +112,20 @@ class Attention(Module):
         if exists(self.value_mlp):
             v = v + self.value_mlp(v)
 
+        # key value memories
+
+        if exists(memory):
+            mk, mv = memory
+            k = cat((mk, k), dim = -2)
+            v = cat((mv, v), dim = -2)
+
         # attention
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
+
+        i, j = sim.shape[-2:]
+        causal_mask = torch.ones((i, j), dtype = torch.bool, device = device)
+        sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim = -1)
 
@@ -115,14 +133,68 @@ class Attention(Module):
 
         # merge heads
 
-        out = self.merge_heads(out)
+        agg = self.merge_heads(out)
 
         # maybe attention gate (nonlinearity)
 
         if exists(self.attn_gate):
-            out = out * self.attn_gate(tokens).sigmoid()
+            agg = agg * self.attn_gate(tokens).sigmoid()
 
-        return self.to_out(out)
+        attn_out = self.to_out(agg)
+
+        assert not (return_memory and return_recurr_memory)
+
+        if not (return_memory or return_recurr_memory):
+            return attn_out
+
+        if return_memory:
+            return attn_out, (k, v)
+
+        # add the output to the residual and then reproject for the 'persistent' key value, key value derived from the output fed back in
+
+        next_token = self.norm(attn_out + residual)
+
+        next_k, next_v = self.to_keys_values(next_token).chunk(2, dim = -1)
+        next_k, next_v = map(self.split_heads, (next_k, next_v))
+
+        next_k = self.k_norm(next_k)
+
+        if exists(self.value_mlp):
+            next_v = next_v + self.value_mlp(next_v)
+
+        if exists(memory):
+            next_k = cat((mk, next_k), dim = -2)
+            next_v = cat((mv, next_v), dim = -2)
+
+        return attn_out, (next_k, next_v)
+
+    def forward_naive_recurrent(
+        self,
+        tokens,
+        memory: tuple[Tensor, Tensor] | None = None,
+        return_memory = False,
+    ):
+        seq_len = tokens.shape[-2]
+
+        outs = []
+
+        for token in tokens.unbind(dim = -2):
+            token = rearrange(token, 'b d -> b 1 d')
+
+            out, memory = self(
+                token,
+                memory = memory,
+                return_recurr_memory = True
+            )
+
+            outs.append(out)
+
+        outs = cat(outs, dim = -2)
+
+        if not return_memory:
+            return outs
+
+        return outs, memory
 
 # feedforward
 
@@ -155,9 +227,12 @@ class RecurrentTransformer(Module):
         depth,
         dim_head = 64,
         heads = 8,
-        ff_expansion = 4.
+        ff_expansion = 4.,
+        naive_recurrent = False
     ):
         super().__init__()
+
+        self.naive_recurrent = naive_recurrent
 
         # embed
 
@@ -207,7 +282,12 @@ class RecurrentTransformer(Module):
         # layers
 
         for attn, ff in self.layers:
-            tokens = attn(tokens) + tokens
+
+            if self.naive_recurrent:
+                tokens = attn.forward_naive_recurrent(tokens) + tokens
+            else:
+                tokens = attn(tokens) + tokens
+
             tokens = ff(tokens) + tokens
 
         # unembed
