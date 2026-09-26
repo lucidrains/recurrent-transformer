@@ -6,6 +6,7 @@ from torch import nn, Tensor, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, RMSNorm, Linear, Sequential
 
+import einx
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
@@ -44,6 +45,64 @@ class LoRA(Module):
     def forward(self, x):
         return self.down(self.up(x))
 
+# positional bias
+
+# relative positional bias borrowed from Thinking Machines' Inkling model
+# the learned alibi variant builds on ALiBi - Press et al. https://arxiv.org/abs/2108.12409
+
+class RelativePositionBias(Module):
+    def __init__(
+        self,
+        heads,
+        num_distance_basis = 16,
+        max_dist = 1024,
+        learned_alibi = True,
+        distance_basis = False
+    ):
+        super().__init__()
+        assert learned_alibi or distance_basis
+
+        self.max_dist = max_dist
+        self.learned_alibi = learned_alibi
+        self.distance_basis = distance_basis
+
+        if learned_alibi:
+            self.to_alibi_slopes = nn.Parameter(torch.ones(heads))
+
+        if distance_basis:
+            self.distance_bank = nn.Parameter(torch.randn(num_distance_basis, max_dist) * 0.02)
+            self.to_head_weights = nn.Parameter(torch.zeros(heads, num_distance_basis))
+
+    def forward(
+        self,
+        seq_len_q,
+        seq_len_k = None
+    ):
+        device = next(self.parameters()).device
+        seq_len_k = default(seq_len_k, seq_len_q)
+
+        pos_q = torch.arange(seq_len_q, device = device) + (seq_len_k - seq_len_q)
+        pos_k = torch.arange(seq_len_k, device = device)
+
+        rel_dist = einx.subtract('i, j -> i j', pos_q, pos_k)
+
+        valid_mask = rel_dist >= 0
+        clamped_dist = rel_dist.clamp(min = 0)
+
+        bias = 0.
+
+        if self.distance_basis:
+            valid_mask = valid_mask & (rel_dist < self.max_dist)
+            clamped_dist = clamped_dist.clamp(max = self.max_dist - 1)
+
+            curves = einsum(self.to_head_weights, self.distance_bank, 'h b, b r -> h r')
+            bias = bias + curves[:, clamped_dist]
+
+        if self.learned_alibi:
+            bias = bias - rearrange(self.to_alibi_slopes, 'h -> h 1 1') * clamped_dist
+
+        return bias.masked_fill(~valid_mask, 0.)
+
 # attention
 
 class Attention(Module):
@@ -56,7 +115,9 @@ class Attention(Module):
         gate_low_rank = 32,
         use_value_mlp = True,
         value_mlp_expansion = 2.,
-        block_size = 1
+        block_size = 1,
+        rel_pos_bias = True,
+        rel_pos_bias_kwargs: dict = dict()
     ):
         super().__init__()
         self.scale = inv_sqrt(dim_head)
@@ -85,6 +146,10 @@ class Attention(Module):
         # value mlp - post project but before aggregation + residual - shown to work well in a iclr 2026 paper for image restoration and apt for this setting
 
         self.value_mlp = MLP(dim_head, int(dim_head * value_mlp_expansion), dim_head) if use_value_mlp else None
+
+        # relative positional bias
+
+        self.rel_pos_bias = RelativePositionBias(heads = heads, **rel_pos_bias_kwargs) if rel_pos_bias else None
 
     def forward(
         self,
@@ -126,6 +191,10 @@ class Attention(Module):
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
         i, j = sim.shape[-2:]
+
+        if exists(self.rel_pos_bias):
+            sim = sim + self.rel_pos_bias(i, j)
+
         causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
         sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
@@ -165,6 +234,7 @@ class Attention(Module):
             next_v = next_v + self.value_mlp(next_v)
 
         if exists(memory):
+            mk, mv = memory
             next_k = cat((mk, next_k), dim = -2)
             next_v = cat((mv, next_v), dim = -2)
 
@@ -228,7 +298,12 @@ class RecurrentTransformer(Module):
         heads = 8,
         ff_expansion = 4.,
         recurrent = False,
-        block_size = 1
+        block_size = 1,
+        attn_gate = True,
+        gate_low_rank = 32,
+        use_value_mlp = True,
+        rel_pos_bias = True,
+        rel_pos_bias_kwargs: dict = dict()
     ):
         super().__init__()
 
@@ -247,7 +322,17 @@ class RecurrentTransformer(Module):
         for layer_index in range(depth):
             layer_depth = layer_index + 1
 
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, block_size = block_size)
+            attn = Attention(
+                dim = dim,
+                dim_head = dim_head,
+                heads = heads,
+                block_size = block_size,
+                attn_gate = attn_gate,
+                gate_low_rank = gate_low_rank,
+                use_value_mlp = use_value_mlp,
+                rel_pos_bias = rel_pos_bias,
+                rel_pos_bias_kwargs = rel_pos_bias_kwargs
+            )
 
             ff = FeedForward(dim = dim, expansion = ff_expansion)
 
@@ -272,9 +357,13 @@ class RecurrentTransformer(Module):
     def forward(
         self,
         ids,
-        return_loss = False
+        return_loss = False,
+        labels = None
     ):
-        if return_loss:
+        if exists(labels):
+            return_loss = True
+
+        if return_loss and not exists(labels):
             ids, labels = ids[:, :-1], ids[:, 1:]
 
         # embed
@@ -285,11 +374,8 @@ class RecurrentTransformer(Module):
 
         for attn, ff in self.layers:
 
-            if self.recurrent:
-                tokens = attn.forward_naive_recurrent(tokens) + tokens
-            else:
-                tokens = attn(tokens) + tokens
-
+            forward_attn = attn.forward_naive_recurrent if self.recurrent else attn
+            tokens = forward_attn(tokens) + tokens
             tokens = ff(tokens) + tokens
 
         # unembed

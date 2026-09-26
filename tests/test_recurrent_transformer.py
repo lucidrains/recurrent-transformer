@@ -6,7 +6,12 @@ from recurrent_transformer.recurrent_transformer import Attention, RecurrentTran
 
 @param('recurrent', (False, True))
 @param('block_size', (1, 2, 4))
-def test_recurrent_transformer(recurrent, block_size):
+@param('rel_pos_bias_kwargs', (
+    dict(),
+    dict(learned_alibi = False, distance_basis = True),
+    dict(learned_alibi = True, distance_basis = True)
+))
+def test_recurrent_transformer(recurrent, block_size, rel_pos_bias_kwargs):
 
     model = RecurrentTransformer(
         num_tokens = 256,
@@ -15,7 +20,8 @@ def test_recurrent_transformer(recurrent, block_size):
         dim_head = 64,
         heads = 2,
         recurrent = recurrent,
-        block_size = block_size
+        block_size = block_size,
+        rel_pos_bias_kwargs = rel_pos_bias_kwargs
     )
 
     ids = torch.randint(0, 256, (2, 16))
