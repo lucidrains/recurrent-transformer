@@ -1,5 +1,5 @@
 [project]
-name = "recurrent-transformer"
+name = "recurrent-transformer-pytorch"
 version = "0.0.1"
 description = "Recurrent Transformer"
 authors = [
