@@ -1,4 +1,6 @@
-# Recurrent Transformer (wip)
+<img src="./fig3.png" width="400px"></img>
+
+## Recurrent Transformer (wip)
 
 Explorations into the [Recurrent Transformer](https://arxiv.org/abs/2604.21215) proposed by Costin-Andrei Oncescu et al. of Harvard University
 
