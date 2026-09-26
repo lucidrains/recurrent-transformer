@@ -9,6 +9,8 @@ from torch.nn import Module, ModuleList, RMSNorm, Linear, Sequential
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
+from x_mlps_pytorch import MLP
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
@@ -24,6 +26,24 @@ def default(v, d):
 def inv_sqrt(n):
     return n ** -0.5
 
+# lora
+
+class LoRA(Module):
+    def __init__(
+        self,
+        dim,
+        dim_out,
+        low_rank = 32
+    ):
+        super().__init__()
+        assert low_rank < dim and low_rank < dim_out, f'low rank ({low_rank}) must be less than dim ({dim}) and dim_out ({dim_out})'
+
+        self.up = LinearNoBias(dim, low_rank)
+        self.down = LinearNoBias(low_rank, dim_out)
+
+    def forward(self, x):
+        return self.down(self.up(x))
+
 # attention
 
 class Attention(Module):
@@ -31,7 +51,11 @@ class Attention(Module):
         self,
         dim,
         dim_head = 64,
-        heads = 8
+        heads = 8,
+        attn_gate = True,
+        gate_low_rank = 32,
+        use_value_mlp = True,
+        value_mlp_expansion = 2.
     ):
         super().__init__()
         self.scale = inv_sqrt(dim_head)
@@ -48,7 +72,17 @@ class Attention(Module):
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
+        # projection out
+
         self.to_out = LinearNoBias(dim_inner, dim)
+
+        # attention gating - Jumper et al. AF2
+
+        self.attn_gate = LoRA(dim, dim_inner) if attn_gate else None
+
+        # value mlp - post project but before aggregation + residual - shown to work well in a iclr 2026 paper for image restoration and apt for this setting
+
+        self.value_mlp = MLP(dim_head, int(dim_head * value_mlp_expansion), dim_head)
 
     def forward(
         self,
@@ -61,8 +95,17 @@ class Attention(Module):
 
         q, k, v = map(self.split_heads, (q, k, v))
 
+        # qk rmsnorm
+
         q = self.q_norm(q)
         k = self.k_norm(k)
+
+        # maybe residual value mlp (nonlinearity)
+
+        if exists(self.value_mlp):
+            v = v + self.value_mlp(v)
+
+        # attention
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
@@ -70,7 +113,15 @@ class Attention(Module):
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
+        # merge heads
+
         out = self.merge_heads(out)
+
+        # maybe attention gate (nonlinearity)
+
+        if exists(self.attn_gate):
+            out = out * self.attn_gate(tokens).sigmoid()
+
         return self.to_out(out)
 
 # feedforward
