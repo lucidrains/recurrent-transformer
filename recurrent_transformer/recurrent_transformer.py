@@ -55,10 +55,12 @@ class Attention(Module):
         attn_gate = True,
         gate_low_rank = 32,
         use_value_mlp = True,
-        value_mlp_expansion = 2.
+        value_mlp_expansion = 2.,
+        block_size = 1
     ):
         super().__init__()
         self.scale = inv_sqrt(dim_head)
+        self.block_size = block_size
 
         self.norm = RMSNorm(dim)
         dim_inner = dim_head * heads
@@ -124,7 +126,7 @@ class Attention(Module):
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
         i, j = sim.shape[-2:]
-        causal_mask = torch.ones((i, j), dtype = torch.bool, device = device)
+        causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
         sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         attn = sim.softmax(dim = -1)
@@ -171,18 +173,15 @@ class Attention(Module):
     def forward_naive_recurrent(
         self,
         tokens,
-        memory: tuple[Tensor, Tensor] | None = None,
         return_memory = False,
     ):
-        seq_len = tokens.shape[-2]
-
         outs = []
 
-        for token in tokens.unbind(dim = -2):
-            token = rearrange(token, 'b d -> b 1 d')
+        memory = None
 
+        for block in tokens.split(self.block_size, dim = -2):
             out, memory = self(
-                token,
+                block,
                 memory = memory,
                 return_recurr_memory = True
             )
@@ -228,11 +227,14 @@ class RecurrentTransformer(Module):
         dim_head = 64,
         heads = 8,
         ff_expansion = 4.,
-        naive_recurrent = False
+        recurrent = False,
+        block_size = 1
     ):
         super().__init__()
 
-        self.naive_recurrent = naive_recurrent
+        assert not recurrent or block_size >= 1
+
+        self.recurrent = recurrent
 
         # embed
 
@@ -245,7 +247,7 @@ class RecurrentTransformer(Module):
         for layer_index in range(depth):
             layer_depth = layer_index + 1
 
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads)
+            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, block_size = block_size)
 
             ff = FeedForward(dim = dim, expansion = ff_expansion)
 
@@ -283,7 +285,7 @@ class RecurrentTransformer(Module):
 
         for attn, ff in self.layers:
 
-            if self.naive_recurrent:
+            if self.recurrent:
                 tokens = attn.forward_naive_recurrent(tokens) + tokens
             else:
                 tokens = attn(tokens) + tokens

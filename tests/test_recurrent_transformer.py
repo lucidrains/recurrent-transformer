@@ -2,11 +2,11 @@ import torch
 import pytest
 param = pytest.mark.parametrize
 
-from torch import nn
 from recurrent_transformer.recurrent_transformer import Attention, RecurrentTransformer
 
-@param('naive_recurrent', (False, True))
-def test_recurrent_transformer(naive_recurrent):
+@param('recurrent', (False, True))
+@param('block_size', (1, 2, 4))
+def test_recurrent_transformer(recurrent, block_size):
 
     model = RecurrentTransformer(
         num_tokens = 256,
@@ -14,7 +14,8 @@ def test_recurrent_transformer(naive_recurrent):
         depth = 2,
         dim_head = 64,
         heads = 2,
-        naive_recurrent = naive_recurrent
+        recurrent = recurrent,
+        block_size = block_size
     )
 
     ids = torch.randint(0, 256, (2, 16))
