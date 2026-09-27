@@ -10,6 +10,8 @@ import einx
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
+from torch_einops_utils import safe_cat, clamp
+
 from x_mlps_pytorch import MLP
 
 # constants
@@ -122,6 +124,8 @@ class Attention(Module):
         super().__init__()
         self.scale = inv_sqrt(dim_head)
         self.block_size = block_size
+        self.heads = heads
+        self.dim_head = dim_head
 
         self.norm = RMSNorm(dim)
         dim_inner = dim_head * heads
@@ -151,6 +155,203 @@ class Attention(Module):
 
         self.rel_pos_bias = RelativePositionBias(heads = heads, **rel_pos_bias_kwargs) if rel_pos_bias else None
 
+    # helper functions for queries, keys, values
+
+    def process_queries(
+        self,
+        tokens
+    ):
+        q = self.to_queries(tokens)
+        q = self.split_heads(q)
+        q = self.q_norm(q)
+        return q
+
+    def process_key_values(
+        self,
+        tokens
+    ):
+        k, v = self.to_keys_values(tokens).chunk(2, dim = -1)
+
+        k, v = map(self.split_heads, (k, v))
+
+        # rmsnorm
+
+        k = self.k_norm(k)
+
+        # maybe residual value mlp (nonlinearity)
+
+        if exists(self.value_mlp):
+            v = v + self.value_mlp(v)
+
+        return k, v
+
+    def merge_and_combine_heads(
+        self,
+        attend_out
+    ):
+        agg = self.merge_heads(attend_out)
+
+        # maybe attention gate (nonlinearity)
+
+        if exists(self.attn_gate):
+            agg = agg * self.attn_gate(agg).sigmoid()
+
+        attn_out = self.to_out(agg)
+
+        return attn_out
+
+    # the proposed tiling approach, based on the author's previous flash inference paper
+
+    def forward_tiled_recurrent(
+        self,
+        tokens,
+        return_memory = False
+    ):
+        batch, seq_len, heads, device = *tokens.shape[:2], self.heads, tokens.device
+
+        residual = tokens
+
+        tokens = self.norm(tokens)
+
+        # queries and temporary key / values
+
+        q = self.process_queries(tokens)
+        k, v = self.process_key_values(tokens)
+
+        # the queries and temporary keys and values can be processed all at once for the initial partial online row outputs
+
+        row_max = einsum(q, k, 'b h n d, b h n d -> b h n') * self.scale
+
+        if exists(self.rel_pos_bias):
+            row_max = row_max + self.rel_pos_bias(1, 1)
+
+        row_max = rearrange(row_max, '... -> ... 1')
+
+        row_sums = torch.ones_like(row_max) # initially ones (subtract itself for zero and exponentiate)
+
+        row_nums = v # numerator would just be the values
+
+        # accumulate output
+
+        attn_outs = None
+
+        persist_k = persist_v = None
+
+        def get_attn_out(index):
+            token_slice = slice(index, index + 1)
+            token_out = row_nums[..., token_slice, :] / row_sums[..., token_slice, :]
+            return self.merge_and_combine_heads(token_out)
+
+        # now process the tiles
+
+        for index in range(seq_len):
+
+            # calculate persistent key value
+
+            persist_token_out = get_attn_out(index)
+
+            # get the first persist key / value for first token
+
+            normed = self.norm(persist_token_out + residual[:, index:(index + 1)])
+
+            next_persist_k, next_persist_v = self.process_key_values(normed)
+
+            persist_k = safe_cat((persist_k, next_persist_k), dim = -2)
+            persist_v = safe_cat((persist_v, next_persist_v), dim = -2)
+
+            attn_outs = safe_cat((attn_outs, persist_token_out), dim = -2)
+
+            # return if last token
+
+            i = index + 1
+
+            if i == seq_len:
+                continue
+
+            # trick for getting the tile size to be processed, taught to me by gemini
+
+            tile_size = i & -i
+
+            # tile slice
+
+            q_tile_slice = slice(i, clamp(i + tile_size, hi = seq_len))
+            kv_tile_slice = slice(i - tile_size, i)
+
+            # get the q, k, v for the tile
+
+            tq = q[..., q_tile_slice, :]
+            tk, tv = persist_k[..., kv_tile_slice, :], persist_v[..., kv_tile_slice, :]
+
+            # calculate tile
+
+            tile_sim = einsum(tq, tk, 'b h i d, b h j d -> b h i j') * self.scale
+
+            if exists(self.rel_pos_bias):
+                q_tile_len = q_tile_slice.stop - q_tile_slice.start
+                kv_tile_len = kv_tile_slice.stop - kv_tile_slice.start
+                tile_sim = tile_sim + self.rel_pos_bias(q_tile_len, q_tile_len + tile_size)[..., :kv_tile_len]
+
+            tile_max = tile_sim.amax(dim = -1, keepdim = True)
+
+            old_row_max = row_max[..., q_tile_slice, :]
+            next_row_max = torch.maximum(old_row_max, tile_max)
+
+            tile_sim_exp = (tile_sim - next_row_max).exp()
+
+            tile_num = einsum(tile_sim_exp, tv, 'b h i j, b h j d -> b h i d')
+
+            tile_sums = tile_sim_exp.sum(dim = -1, keepdim = True)
+
+            # update partials
+
+            renorm = (old_row_max - next_row_max).exp()
+
+            row_sums[..., q_tile_slice, :] = row_sums[..., q_tile_slice, :] * renorm + tile_sums
+            row_nums[..., q_tile_slice, :] = row_nums[..., q_tile_slice, :] * renorm + tile_num
+            row_max[..., q_tile_slice, :] = next_row_max
+
+        # return
+
+        if not return_memory:
+            return attn_outs
+
+        memory = (persist_k, persist_v)
+
+        return attn_outs, memory
+
+    def forward_naive_recurrent(
+        self,
+        tokens,
+        memory: tuple[Tensor, Tensor] | None = None,
+        return_memory = False,
+    ):
+
+        # accumulate output
+
+        outs = []
+
+        # one token at a time, the memory returned is always the 'persistent' / recurrent key values
+
+        for block in tokens.split(self.block_size, dim = -2):
+            out, memory = self(
+                block,
+                memory = memory,
+                return_recurr_memory = True
+            )
+
+            outs.append(out)
+
+        # post process
+
+        outs = cat(outs, dim = -2)
+
+        # return
+
+        if not return_memory:
+            return outs
+
+        return outs, memory
+
     def forward(
         self,
         tokens,
@@ -164,20 +365,13 @@ class Attention(Module):
 
         tokens = self.norm(tokens)
 
-        q = self.to_queries(tokens)
-        k, v = self.to_keys_values(tokens).chunk(2, dim = -1)
+        # queries
 
-        q, k, v = map(self.split_heads, (q, k, v))
+        q = self.process_queries(tokens)
 
-        # qk rmsnorm
+        # key values
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # maybe residual value mlp (nonlinearity)
-
-        if exists(self.value_mlp):
-            v = v + self.value_mlp(v)
+        k, v = self.process_key_values(tokens)
 
         # key value memories
 
@@ -200,18 +394,11 @@ class Attention(Module):
 
         attn = sim.softmax(dim = -1)
 
-        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+        attend_out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
-        # merge heads
+        # merge heads and combine
 
-        agg = self.merge_heads(out)
-
-        # maybe attention gate (nonlinearity)
-
-        if exists(self.attn_gate):
-            agg = agg * self.attn_gate(tokens).sigmoid()
-
-        attn_out = self.to_out(agg)
+        attn_out = self.merge_and_combine_heads(attend_out)
 
         assert not (return_memory and return_recurr_memory)
 
@@ -225,13 +412,7 @@ class Attention(Module):
 
         next_token = self.norm(attn_out + residual)
 
-        next_k, next_v = self.to_keys_values(next_token).chunk(2, dim = -1)
-        next_k, next_v = map(self.split_heads, (next_k, next_v))
-
-        next_k = self.k_norm(next_k)
-
-        if exists(self.value_mlp):
-            next_v = next_v + self.value_mlp(next_v)
+        next_k, next_v = self.process_key_values(next_token)
 
         if exists(memory):
             mk, mv = memory
@@ -239,31 +420,6 @@ class Attention(Module):
             next_v = cat((mv, next_v), dim = -2)
 
         return attn_out, (next_k, next_v)
-
-    def forward_naive_recurrent(
-        self,
-        tokens,
-        return_memory = False,
-    ):
-        outs = []
-
-        memory = None
-
-        for block in tokens.split(self.block_size, dim = -2):
-            out, memory = self(
-                block,
-                memory = memory,
-                return_recurr_memory = True
-            )
-
-            outs.append(out)
-
-        outs = cat(outs, dim = -2)
-
-        if not return_memory:
-            return outs
-
-        return outs, memory
 
 # feedforward
 
@@ -298,6 +454,7 @@ class RecurrentTransformer(Module):
         heads = 8,
         ff_expansion = 4.,
         recurrent = False,
+        recurrent_mode = 'naive',
         block_size = 1,
         attn_gate = True,
         gate_low_rank = 32,
@@ -309,7 +466,10 @@ class RecurrentTransformer(Module):
 
         assert not recurrent or block_size >= 1
 
+        assert recurrent_mode in ('naive', 'tiled')
+
         self.recurrent = recurrent
+        self.recurrent_mode = recurrent_mode
 
         # embed
 
@@ -350,7 +510,7 @@ class RecurrentTransformer(Module):
         # unembed
 
         self.to_logits = Sequential(
-            nn.RMSNorm(dim),
+            RMSNorm(dim),
             LinearNoBias(dim, num_tokens)
         )
 
@@ -358,8 +518,13 @@ class RecurrentTransformer(Module):
         self,
         ids,
         return_loss = False,
-        labels = None
+        labels = None,
+        recurrent_mode = None
     ):
+        recurrent_mode = default(recurrent_mode, self.recurrent_mode)
+
+        assert recurrent_mode in ('naive', 'tiled')
+
         if exists(labels):
             return_loss = True
 
@@ -374,7 +539,13 @@ class RecurrentTransformer(Module):
 
         for attn, ff in self.layers:
 
-            forward_attn = attn.forward_naive_recurrent if self.recurrent else attn
+            forward_attn = attn
+
+            if self.recurrent and recurrent_mode == 'tiled':
+                forward_attn = attn.forward_tiled_recurrent
+            elif self.recurrent:
+                forward_attn = attn.forward_naive_recurrent
+
             tokens = forward_attn(tokens) + tokens
             tokens = ff(tokens) + tokens
 
