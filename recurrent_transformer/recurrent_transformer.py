@@ -250,7 +250,7 @@ class Attention(Module):
 
             persist_token_out = get_attn_out(index)
 
-            # get the first persist key / value for first token
+            # get the next persistent / recurrent - key value
 
             normed = self.norm(persist_token_out + residual[:, index:(index + 1)])
 
@@ -261,7 +261,7 @@ class Attention(Module):
 
             attn_outs = safe_cat((attn_outs, persist_token_out), dim = -2)
 
-            # return if last token
+            # return if last token, as nothing online left to update
 
             i = index + 1
 
