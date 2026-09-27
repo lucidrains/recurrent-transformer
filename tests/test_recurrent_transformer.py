@@ -61,3 +61,5 @@ def test_naive_vs_tiled_recurrent(seq_len, rel_pos_bias_kwargs):
         tiled_out = model(ids, recurrent_mode = 'tiled')
 
     assert torch.allclose(naive_out, tiled_out, atol = 1e-5)
+
+    model(ids, return_loss = True, recurrent_mode = 'tiled').backward()

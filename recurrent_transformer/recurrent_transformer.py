@@ -207,6 +207,8 @@ class Attention(Module):
         tokens,
         return_memory = False
     ):
+        assert self.block_size == 1, 'tiled recurrent only supports block size of 1'
+
         batch, seq_len, heads, device = *tokens.shape[:2], self.heads, tokens.device
 
         residual = tokens
@@ -306,9 +308,11 @@ class Attention(Module):
 
             renorm = (old_row_max - next_row_max).exp()
 
-            row_sums[..., q_tile_slice, :] = row_sums[..., q_tile_slice, :] * renorm + tile_sums
-            row_nums[..., q_tile_slice, :] = row_nums[..., q_tile_slice, :] * renorm + tile_num
-            row_max[..., q_tile_slice, :] = next_row_max
+            q_indices = torch.arange(q_tile_slice.start, q_tile_slice.stop, device = device)
+
+            row_sums = row_sums.index_copy(-2, q_indices, row_sums[..., q_tile_slice, :] * renorm + tile_sums)
+            row_nums = row_nums.index_copy(-2, q_indices, row_nums[..., q_tile_slice, :] * renorm + tile_num)
+            row_max = row_max.index_copy(-2, q_indices, next_row_max)
 
         # return
 
