@@ -36,13 +36,14 @@ def test_recurrent_transformer(recurrent, block_size, rel_pos_bias_kwargs):
 
     loss.backward()
 
+@param('batch', (1, 2))
 @param('seq_len', (16, 12))
 @param('rel_pos_bias_kwargs', (
     dict(),
     dict(learned_alibi = False, distance_basis = True),
     dict(learned_alibi = True, distance_basis = True)
 ))
-def test_naive_vs_tiled_recurrent(seq_len, rel_pos_bias_kwargs):
+def test_naive_vs_tiled_recurrent(batch, seq_len, rel_pos_bias_kwargs):
 
     model = RecurrentTransformer(
         num_tokens = 256,
@@ -54,7 +55,7 @@ def test_naive_vs_tiled_recurrent(seq_len, rel_pos_bias_kwargs):
         rel_pos_bias_kwargs = rel_pos_bias_kwargs
     )
 
-    ids = torch.randint(0, 256, (2, seq_len))
+    ids = torch.randint(0, 256, (batch, seq_len))
 
     with torch.no_grad():
         naive_out = model(ids)

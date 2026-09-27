@@ -209,7 +209,7 @@ class Attention(Module):
     ):
         assert self.block_size == 1, 'tiled recurrent only supports block size of 1'
 
-        batch, seq_len, heads, device = *tokens.shape[:2], self.heads, tokens.device
+        seq_len = tokens.shape[1]
 
         residual = tokens
 
@@ -225,7 +225,7 @@ class Attention(Module):
         row_max = einsum(q, k, 'b h n d, b h n d -> b h n') * self.scale
 
         if exists(self.rel_pos_bias):
-            row_max = row_max + self.rel_pos_bias(1, 1)
+            row_max = einx.add('b h n, h ... -> b h n', row_max, self.rel_pos_bias(1, 1))
 
         row_max = rearrange(row_max, '... -> ... 1')
 
@@ -241,7 +241,11 @@ class Attention(Module):
 
         def get_attn_out(index):
             token_slice = slice(index, index + 1)
-            token_out = row_nums[..., token_slice, :] / row_sums[..., token_slice, :]
+
+            token_num = row_nums[..., token_slice, :].clone()
+            token_sums = row_sums[..., token_slice, :].clone()
+
+            token_out = token_num / token_sums
             return self.merge_and_combine_heads(token_out)
 
         # now process the tiles
@@ -295,7 +299,12 @@ class Attention(Module):
 
             tile_max = tile_sim.amax(dim = -1, keepdim = True)
 
-            old_row_max = row_max[..., q_tile_slice, :]
+            # clone the old partials
+
+            old_row_max = row_max[..., q_tile_slice, :].clone()
+            old_row_sums = row_sums[..., q_tile_slice, :].clone()
+            old_row_nums = row_nums[..., q_tile_slice, :].clone()
+
             next_row_max = torch.maximum(old_row_max, tile_max)
 
             tile_sim_exp = (tile_sim - next_row_max).exp()
@@ -304,15 +313,13 @@ class Attention(Module):
 
             tile_sums = tile_sim_exp.sum(dim = -1, keepdim = True)
 
-            # update partials
+            # update partials in place, as the tile of queries is a contiguous slice
 
             renorm = (old_row_max - next_row_max).exp()
 
-            q_indices = torch.arange(q_tile_slice.start, q_tile_slice.stop, device = device)
-
-            row_sums = row_sums.index_copy(-2, q_indices, row_sums[..., q_tile_slice, :] * renorm + tile_sums)
-            row_nums = row_nums.index_copy(-2, q_indices, row_nums[..., q_tile_slice, :] * renorm + tile_num)
-            row_max = row_max.index_copy(-2, q_indices, next_row_max)
+            row_sums[..., q_tile_slice, :] = old_row_sums * renorm + tile_sums
+            row_nums[..., q_tile_slice, :] = old_row_nums * renorm + tile_num
+            row_max[..., q_tile_slice, :] = next_row_max
 
         # return
 
