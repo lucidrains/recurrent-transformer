@@ -10,7 +10,7 @@ import einx
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import safe_cat, clamp
+from torch_einops_utils import clamp
 
 from x_mlps_pytorch import MLP
 
@@ -235,9 +235,9 @@ class Attention(Module):
 
         # accumulate output
 
-        attn_outs = None
-
-        persist_k = persist_v = None
+        attn_outs = []
+        persist_ks = []
+        persist_vs = []
 
         def get_attn_out(index):
             token_slice = slice(index, index + 1)
@@ -262,10 +262,10 @@ class Attention(Module):
 
             next_persist_k, next_persist_v = self.process_key_values(normed)
 
-            persist_k = safe_cat((persist_k, next_persist_k), dim = -2)
-            persist_v = safe_cat((persist_v, next_persist_v), dim = -2)
+            persist_ks.append(next_persist_k)
+            persist_vs.append(next_persist_v)
 
-            attn_outs = safe_cat((attn_outs, persist_token_out), dim = -2)
+            attn_outs.append(persist_token_out)
 
             # return if last token, as nothing online left to update
 
@@ -286,7 +286,8 @@ class Attention(Module):
             # get the q, k, v for the tile
 
             tq = q[..., q_tile_slice, :]
-            tk, tv = persist_k[..., kv_tile_slice, :], persist_v[..., kv_tile_slice, :]
+            tk = cat(persist_ks[kv_tile_slice], dim = -2)
+            tv = cat(persist_vs[kv_tile_slice], dim = -2)
 
             # calculate tile
 
@@ -323,10 +324,12 @@ class Attention(Module):
 
         # return
 
+        attn_outs = cat(attn_outs, dim = -2)
+
         if not return_memory:
             return attn_outs
 
-        memory = (persist_k, persist_v)
+        memory = (cat(persist_ks, dim = -2), cat(persist_vs, dim = -2))
 
         return attn_outs, memory
 
