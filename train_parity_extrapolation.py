@@ -8,9 +8,10 @@
 
 import fire
 import torch
+from torch import nn
 from torch.optim import AdamW
 
-from recurrent_transformer import RecurrentTransformer
+from recurrent_transformer import GatedTransition, RecurrentTransformer
 
 # parity task
 
@@ -21,6 +22,7 @@ def generate_batch(batch_size, seq_len):
 def main(
     recurrent_mode = 'tiled',
     block_size = 1,
+    state_transition = 'none',
     train_seq_len = 16,
     batch_size = 64,
     num_steps = 1000,
@@ -30,6 +32,7 @@ def main(
 ):
     assert recurrent_mode in ('naive', 'tiled')
     assert block_size >= 1
+    assert state_transition in ('none', 'gated', 'gru')
 
     # seed
 
@@ -37,23 +40,32 @@ def main(
 
     # model
 
+    dim = 32
+    transition = None
+
+    if state_transition == 'gru':
+        transition = nn.GRU(dim, dim, batch_first = True)
+    elif state_transition == 'gated':
+        transition = GatedTransition(dim)
+
     model = RecurrentTransformer(
         num_tokens = 2,
-        dim = 32,
+        dim = dim,
         depth = 2,
         dim_head = 16,
         heads = 2,
         recurrent = True,
         recurrent_mode = recurrent_mode,
         block_size = block_size,
-        gate_low_rank = 16
+        gate_low_rank = 16,
+        state_transition = transition
     )
 
     optimizer = AdamW(model.parameters(), lr = lr, weight_decay = weight_decay)
 
     # train on short sequences
 
-    print(f'training parity on seq len {train_seq_len} ({recurrent_mode} recurrent, block size {block_size})...\n')
+    print(f'training parity on seq len {train_seq_len} ({recurrent_mode} recurrent, block size {block_size}, state transition {state_transition})...\n')
 
     for step in range(1, num_steps + 1):
         tokens, labels = generate_batch(batch_size, train_seq_len)

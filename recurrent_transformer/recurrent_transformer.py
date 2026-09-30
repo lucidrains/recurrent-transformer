@@ -1,4 +1,5 @@
 from __future__ import annotations
+from copy import deepcopy
 from functools import partial
 from math import ceil
 
@@ -100,6 +101,21 @@ class IntraBlockRNN(Module):
 
         return inverse_pad(self.to_out(hiddens))
 
+# state transition
+
+# any module with (z, state) -> (z, state), e.g. an nn.GRU drops in directly
+
+class GatedTransition(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.to_gate = LinearNoBias(dim, dim)
+        self.to_value = LinearNoBias(dim, dim)
+
+    def forward(self, z, state = None):
+        gate = self.to_gate(z).sigmoid()
+        value = self.to_value(z).tanh()
+        return z.lerp(value, gate), state
+
 # lora
 
 class LoRA(Module):
@@ -191,6 +207,7 @@ class Attention(Module):
         block_size = 1,
         use_intra_block_rnn = True,
         intra_block_rnn_kwargs: dict = dict(),
+        state_transition: Module | None = None,
         rel_pos_bias = True,
         rel_pos_bias_kwargs: dict = dict()
     ):
@@ -227,6 +244,8 @@ class Attention(Module):
         # intra block rnn - gives the later tokens of a block a causal recurrent summary of the earlier ones, defaults to a gru
 
         self.intra_block_rnn = IntraBlockRNN(dim, block_size, **intra_block_rnn_kwargs) if use_intra_block_rnn and block_size > 1 else None
+
+        self.state_transition = state_transition
 
         # relative positional bias
 
@@ -289,6 +308,8 @@ class Attention(Module):
 
         # pad to multiple of block size
 
+        orig_seq_len = size(tokens, 'b [n] d')
+
         tokens, inverse_pad = pad_at_dim_to_multiple(tokens, block_size, dim = -2)
 
         seq_len = size(tokens, 'b [n] d')
@@ -338,6 +359,8 @@ class Attention(Module):
         persist_ks = []
         persist_vs = []
 
+        state = None
+
         def get_attn_out(block_index):
             token_slice = slice(block_index * block_size, (block_index + 1) * block_size)
 
@@ -362,6 +385,13 @@ class Attention(Module):
             # get the next persistent / recurrent - key value
 
             normed = self.norm(persist_token_out + residual[:, token_slice])
+
+            # only non padded positions, so carried state matches the naive mode
+
+            if exists(self.state_transition):
+                block_len = clamp(orig_seq_len - block_index * block_size, hi = block_size)
+                transitioned, state = self.state_transition(normed[:, :block_len], state)
+                normed = cat((transitioned, normed[:, block_len:]), dim = -2)
 
             next_persist_k, next_persist_v = self.process_key_values(normed, persistent = True)
 
@@ -434,14 +464,14 @@ class Attention(Module):
         persist_k = cat(persist_ks, dim = -2)
         persist_v = cat(persist_vs, dim = -2)
 
-        memory = (inverse_pad(persist_k), inverse_pad(persist_v))
+        memory = (inverse_pad(persist_k), inverse_pad(persist_v), state)
 
         return attn_outs, memory
 
     def forward_naive_recurrent(
         self,
         tokens,
-        memory: tuple[Tensor, Tensor] | None = None,
+        memory: tuple[Tensor, Tensor, Tensor | None] | None = None,
         return_memory = False
     ):
 
@@ -474,7 +504,7 @@ class Attention(Module):
     def forward(
         self,
         tokens,
-        memory: tuple[Tensor, Tensor] | None = None,
+        memory: tuple[Tensor, Tensor, Tensor | None] | None = None,
         return_memory = False,
         return_recurr_memory = False
     ):
@@ -497,8 +527,10 @@ class Attention(Module):
 
         # key value memories
 
+        mk = mv = state = None
+
         if exists(memory):
-            mk, mv = memory
+            mk, mv, state = memory
 
             assert_shape([(tokens, 'b n d'), (mk, 'b h m dh'), (mv, 'b h m dh')], h = self.heads, dh = self.dim_head)
 
@@ -531,20 +563,22 @@ class Attention(Module):
             return attn_out
 
         if return_memory:
-            return attn_out, (k, v)
+            return attn_out, (k, v, state)
 
         # add the output to the residual and then reproject for the 'persistent' key value, key value derived from the output fed back in
 
         next_token = self.norm(attn_out + residual)
 
+        if exists(self.state_transition):
+            next_token, state = self.state_transition(next_token, state)
+
         next_k, next_v = self.process_key_values(next_token, persistent = True)
 
         if exists(memory):
-            mk, mv = memory
             next_k = cat((mk, next_k), dim = -2)
             next_v = cat((mv, next_v), dim = -2)
 
-        return attn_out, (next_k, next_v)
+        return attn_out, (next_k, next_v, state)
 
 # feedforward
 
@@ -586,6 +620,7 @@ class RecurrentTransformer(Module):
         use_value_mlp = True,
         use_intra_block_rnn = True,
         intra_block_rnn_kwargs: dict = dict(),
+        state_transition: Module | None = None,
         rel_pos_bias = True,
         rel_pos_bias_kwargs: dict = dict()
     ):
@@ -608,6 +643,10 @@ class RecurrentTransformer(Module):
         for layer_index in range(depth):
             layer_depth = layer_index + 1
 
+            # own copy per layer
+
+            transition = deepcopy(state_transition)
+
             attn = Attention(
                 dim = dim,
                 dim_head = dim_head,
@@ -618,6 +657,7 @@ class RecurrentTransformer(Module):
                 use_value_mlp = use_value_mlp,
                 use_intra_block_rnn = use_intra_block_rnn,
                 intra_block_rnn_kwargs = intra_block_rnn_kwargs,
+                state_transition = transition,
                 rel_pos_bias = rel_pos_bias,
                 rel_pos_bias_kwargs = rel_pos_bias_kwargs
             )
