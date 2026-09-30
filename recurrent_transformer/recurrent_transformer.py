@@ -16,6 +16,16 @@ from torch_einops_utils.shape import assert_shape, shape, size
 
 from x_mlps_pytorch import MLP
 
+# einstein equations
+
+# b - batch
+# h - heads
+# n - sequence length
+# i - source sequence
+# j - target sequence
+# s - block size
+# d - feature dimension
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
