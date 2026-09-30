@@ -4,6 +4,41 @@
 
 Explorations into the [Recurrent Transformer](https://arxiv.org/abs/2604.21215) proposed by Costin-Andrei Oncescu et al. of Harvard University
 
+## Usage
+
+```python
+import torch
+from recurrent_transformer import RecurrentTransformer
+
+model = RecurrentTransformer(
+    num_tokens = 256,
+    dim = 512,
+    depth = 6,
+    recurrent = True
+)
+
+tokens = torch.randint(0, 256, (2, 1024))
+
+# forward for loss
+
+loss = model(tokens, return_loss = True)
+loss.backward()
+
+# generate
+
+prompt = torch.randint(0, 256, (2, 32))
+
+sampled = model.generate(prompt, 128) # (2, 128)
+```
+
+## Train
+
+Train on enwik8, validating at the trained length and extrapolated length
+
+```bash
+$ uv run train_enwik8.py
+```
+
 ## Citations
 
 ```bibtex

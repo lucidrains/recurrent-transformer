@@ -20,6 +20,7 @@ def generate_batch(batch_size, seq_len):
 
 def main(
     recurrent_mode = 'tiled',
+    block_size = 1,
     train_seq_len = 16,
     batch_size = 64,
     num_steps = 1000,
@@ -28,6 +29,7 @@ def main(
     seed = 42
 ):
     assert recurrent_mode in ('naive', 'tiled')
+    assert block_size >= 1
 
     # seed
 
@@ -43,6 +45,7 @@ def main(
         heads = 2,
         recurrent = True,
         recurrent_mode = recurrent_mode,
+        block_size = block_size,
         gate_low_rank = 16
     )
 
@@ -50,7 +53,7 @@ def main(
 
     # train on short sequences
 
-    print(f'training parity on seq len {train_seq_len} ({recurrent_mode} recurrent)...\n')
+    print(f'training parity on seq len {train_seq_len} ({recurrent_mode} recurrent, block size {block_size})...\n')
 
     for step in range(1, num_steps + 1):
         tokens, labels = generate_batch(batch_size, train_seq_len)

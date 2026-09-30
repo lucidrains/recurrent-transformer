@@ -1,5 +1,6 @@
 from __future__ import annotations
 from functools import partial
+from math import ceil
 
 import torch
 from torch import nn, Tensor, cat
@@ -10,7 +11,8 @@ import einx
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import clamp
+from torch_einops_utils import clamp, pack_with_inverse, pad_at_dim_to_multiple, temp_eval
+from torch_einops_utils.shape import assert_shape, shape
 
 from x_mlps_pytorch import MLP
 
@@ -28,6 +30,65 @@ def default(v, d):
 
 def inv_sqrt(n):
     return n ** -0.5
+
+# sampling helpers
+
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1, eps = 1e-10):
+    if temperature == 0.:
+        return t.argmax(dim = dim)
+
+    return ((t / max(temperature, eps)) + gumbel_noise(t)).argmax(dim = dim)
+
+def top_k(logits, num_kept: int | None = None, frac_num_tokens = 0.1):
+    num_tokens = shape(logits, '... l').l
+
+    num_kept = default(num_kept, ceil(frac_num_tokens * num_tokens))
+
+    threshold = logits.topk(num_kept, dim = -1).values[..., -1:]
+    return logits.masked_fill(logits < threshold, float('-inf'))
+
+# intra block rnn
+
+class IntraBlockRNN(Module):
+    def __init__(
+        self,
+        dim,
+        block_size,
+        dim_hidden = None,
+        num_layers = 1,
+        rnn_type = nn.GRU,
+        rnn_kwargs: dict = dict()
+    ):
+        super().__init__()
+        self.block_size = block_size
+
+        dim_hidden = default(dim_hidden, dim)
+        self.rnn = rnn_type(dim, dim_hidden, num_layers = num_layers, batch_first = True, **rnn_kwargs)
+
+        self.to_out = LinearNoBias(dim_hidden, dim) if dim_hidden != dim else nn.Identity()
+
+    def forward(self, tokens):
+        block_size = self.block_size
+        batch = shape(tokens, 'b ...').b
+
+        # pad to multiple of block size
+
+        tokens, inverse_pad = pad_at_dim_to_multiple(tokens, block_size, dim = -2)
+
+        # run the rnn causally over each block of tokens in parallel
+
+        tokens = rearrange(tokens, 'b (n s) d -> (b n) s d', s = block_size)
+        hiddens, _ = self.rnn(tokens)
+        hiddens = rearrange(hiddens, '(b n) s d -> b (n s) d', b = batch)
+
+        return inverse_pad(self.to_out(hiddens))
 
 # lora
 
@@ -118,6 +179,8 @@ class Attention(Module):
         use_value_mlp = True,
         value_mlp_expansion = 2.,
         block_size = 1,
+        use_intra_block_rnn = True,
+        intra_block_rnn_kwargs: dict = dict(),
         rel_pos_bias = True,
         rel_pos_bias_kwargs: dict = dict()
     ):
@@ -145,11 +208,15 @@ class Attention(Module):
 
         # attention gating - Jumper et al. AF2
 
-        self.attn_gate = LoRA(dim, dim_inner, low_rank = gate_low_rank) if attn_gate else None
+        self.attn_gate = LoRA(dim_inner, dim_inner, low_rank = gate_low_rank) if attn_gate else None
 
-        # value mlp - post project but before aggregation + residual - shown to work well in a iclr 2026 paper for image restoration and apt for this setting
+        # value mlp - only for persistent key values
 
         self.value_mlp = MLP(dim_head, int(dim_head * value_mlp_expansion), dim_head) if use_value_mlp else None
+
+        # intra block rnn - gives the later tokens of a block a causal recurrent summary of the earlier ones, defaults to a gru
+
+        self.intra_block_rnn = IntraBlockRNN(dim, block_size, **intra_block_rnn_kwargs) if use_intra_block_rnn and block_size > 1 else None
 
         # relative positional bias
 
@@ -168,7 +235,8 @@ class Attention(Module):
 
     def process_key_values(
         self,
-        tokens
+        tokens,
+        persistent = False
     ):
         k, v = self.to_keys_values(tokens).chunk(2, dim = -1)
 
@@ -178,9 +246,9 @@ class Attention(Module):
 
         k = self.k_norm(k)
 
-        # maybe residual value mlp (nonlinearity)
+        # maybe residual value mlp (nonlinearity), only for the persistent values
 
-        if exists(self.value_mlp):
+        if persistent and exists(self.value_mlp):
             v = v + self.value_mlp(v)
 
         return k, v
@@ -207,31 +275,52 @@ class Attention(Module):
         tokens,
         return_memory = False
     ):
-        assert self.block_size == 1, 'tiled recurrent only supports block size of 1'
+        block_size = self.block_size
 
-        seq_len = tokens.shape[1]
+        # pad to multiple of block size
+
+        tokens, inverse_pad = pad_at_dim_to_multiple(tokens, block_size, dim = -2)
+
+        seq_len = shape(tokens, 'b n d').n
 
         residual = tokens
 
         tokens = self.norm(tokens)
+
+        if exists(self.intra_block_rnn):
+            tokens = tokens + self.intra_block_rnn(tokens)
 
         # queries and temporary key / values
 
         q = self.process_queries(tokens)
         k, v = self.process_key_values(tokens)
 
-        # the queries and temporary keys and values can be processed all at once for the initial partial online row outputs
+        # the queries and temporary keys and values can be processed all at once for the initial partial online row outputs, causal within each block
 
-        row_max = einsum(q, k, 'b h n d, b h n d -> b h n') * self.scale
+        q_blk = rearrange(q, 'b h (n s) d -> b h n s d', s = block_size)
+        k_blk = rearrange(k, 'b h (n s) d -> b h n s d', s = block_size)
+        v_blk = rearrange(v, 'b h (n s) d -> b h n s d', s = block_size)
+
+        row_sim = einsum(q_blk, k_blk, 'b h n i d, b h n j d -> b h n i j') * self.scale
 
         if exists(self.rel_pos_bias):
-            row_max = einx.add('b h n, h ... -> b h n', row_max, self.rel_pos_bias(1, 1))
+            row_sim = row_sim + rearrange(self.rel_pos_bias(block_size, block_size), 'h i j -> 1 h 1 i j')
 
-        row_max = rearrange(row_max, '... -> ... 1')
+        if block_size > 1:
+            causal_mask = torch.ones((block_size, block_size), dtype = torch.bool, device = row_sim.device).triu(1)
+            row_sim = row_sim.masked_fill(causal_mask, -torch.finfo(row_sim.dtype).max)
 
-        row_sums = torch.ones_like(row_max) # initially ones (subtract itself for zero and exponentiate)
+        row_max = row_sim.amax(dim = -1, keepdim = True)
+        row_exp = (row_sim - row_max).exp()
 
-        row_nums = v # numerator would just be the values
+        row_sums = row_exp.sum(dim = -1, keepdim = True)
+        row_nums = einsum(row_exp, v_blk, 'b h n i j, b h n j d -> b h n i d')
+
+        # flatten back to the sequence, the row max is cloned as it is updated in place below
+
+        row_max = rearrange(row_max, 'b h n s 1 -> b h (n s) 1').clone()
+        row_sums = rearrange(row_sums, 'b h n s 1 -> b h (n s) 1')
+        row_nums = rearrange(row_nums, 'b h n s d -> b h (n s) d')
 
         # accumulate output
 
@@ -239,8 +328,8 @@ class Attention(Module):
         persist_ks = []
         persist_vs = []
 
-        def get_attn_out(index):
-            token_slice = slice(index, index + 1)
+        def get_attn_out(block_index):
+            token_slice = slice(block_index * block_size, (block_index + 1) * block_size)
 
             token_num = row_nums[..., token_slice, :].clone()
             token_sums = row_sums[..., token_slice, :].clone()
@@ -248,39 +337,43 @@ class Attention(Module):
             token_out = token_num / token_sums
             return self.merge_and_combine_heads(token_out)
 
-        # now process the tiles
+        # now process the tiles, one block at a time
 
-        for index in range(seq_len):
+        num_blocks = seq_len // block_size
+
+        for block_index in range(num_blocks):
+
+            token_slice = slice(block_index * block_size, (block_index + 1) * block_size)
 
             # calculate persistent key value
 
-            persist_token_out = get_attn_out(index)
+            persist_token_out = get_attn_out(block_index)
 
             # get the next persistent / recurrent - key value
 
-            normed = self.norm(persist_token_out + residual[:, index:(index + 1)])
+            normed = self.norm(persist_token_out + residual[:, token_slice])
 
-            next_persist_k, next_persist_v = self.process_key_values(normed)
+            next_persist_k, next_persist_v = self.process_key_values(normed, persistent = True)
 
             persist_ks.append(next_persist_k)
             persist_vs.append(next_persist_v)
 
             attn_outs.append(persist_token_out)
 
-            # return if last token, as nothing online left to update
+            # if last block, nothing online left to update
 
-            i = index + 1
+            i = block_index + 1
 
-            if i == seq_len:
+            if i == num_blocks:
                 continue
 
             # trick for getting the tile size to be processed, taught to me by gemini
 
             tile_size = i & -i
 
-            # tile slice
+            # tile slices
 
-            q_tile_slice = slice(i, clamp(i + tile_size, hi = seq_len))
+            q_tile_slice = slice(i * block_size, clamp((i + tile_size) * block_size, hi = seq_len))
             kv_tile_slice = slice(i - tile_size, i)
 
             # get the q, k, v for the tile
@@ -294,9 +387,9 @@ class Attention(Module):
             tile_sim = einsum(tq, tk, 'b h i d, b h j d -> b h i j') * self.scale
 
             if exists(self.rel_pos_bias):
-                q_tile_len = q_tile_slice.stop - q_tile_slice.start
-                kv_tile_len = kv_tile_slice.stop - kv_tile_slice.start
-                tile_sim = tile_sim + self.rel_pos_bias(q_tile_len, q_tile_len + tile_size)[..., :kv_tile_len]
+                q_tile_len, = shape(tq, 'b h [i] d')
+                kv_tile_len, = shape(tk, 'b h [j] d')
+                tile_sim = tile_sim + self.rel_pos_bias(q_tile_len, q_tile_len + kv_tile_len)[..., :kv_tile_len]
 
             tile_max = tile_sim.amax(dim = -1, keepdim = True)
 
@@ -324,12 +417,15 @@ class Attention(Module):
 
         # return
 
-        attn_outs = cat(attn_outs, dim = -2)
+        attn_outs = inverse_pad(cat(attn_outs, dim = -2))
 
         if not return_memory:
             return attn_outs
 
-        memory = (cat(persist_ks, dim = -2), cat(persist_vs, dim = -2))
+        persist_k = cat(persist_ks, dim = -2)
+        persist_v = cat(persist_vs, dim = -2)
+
+        memory = (inverse_pad(persist_k), inverse_pad(persist_v))
 
         return attn_outs, memory
 
@@ -337,14 +433,14 @@ class Attention(Module):
         self,
         tokens,
         memory: tuple[Tensor, Tensor] | None = None,
-        return_memory = False,
+        return_memory = False
     ):
 
         # accumulate output
 
         outs = []
 
-        # one token at a time, the memory returned is always the 'persistent' / recurrent key values
+        # one block at a time, the memory returned is always the 'persistent' / recurrent key values
 
         for block in tokens.split(self.block_size, dim = -2):
             out, memory = self(
@@ -379,6 +475,9 @@ class Attention(Module):
 
         tokens = self.norm(tokens)
 
+        if exists(self.intra_block_rnn):
+            tokens = tokens + self.intra_block_rnn(tokens)
+
         # queries
 
         q = self.process_queries(tokens)
@@ -391,6 +490,9 @@ class Attention(Module):
 
         if exists(memory):
             mk, mv = memory
+
+            assert_shape([(tokens, 'b n d'), (mk, 'b h m dh'), (mv, 'b h m dh')], h = self.heads, dh = self.dim_head)
+
             k = cat((mk, k), dim = -2)
             v = cat((mv, v), dim = -2)
 
@@ -398,7 +500,7 @@ class Attention(Module):
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
-        i, j = sim.shape[-2:]
+        i, j = shape(sim, 'b h [i j]')
 
         if exists(self.rel_pos_bias):
             sim = sim + self.rel_pos_bias(i, j)
@@ -426,7 +528,7 @@ class Attention(Module):
 
         next_token = self.norm(attn_out + residual)
 
-        next_k, next_v = self.process_key_values(next_token)
+        next_k, next_v = self.process_key_values(next_token, persistent = True)
 
         if exists(memory):
             mk, mv = memory
@@ -468,18 +570,19 @@ class RecurrentTransformer(Module):
         heads = 8,
         ff_expansion = 4.,
         recurrent = False,
-        recurrent_mode = 'naive',
+        recurrent_mode = 'tiled',
         block_size = 1,
         attn_gate = True,
         gate_low_rank = 32,
         use_value_mlp = True,
+        use_intra_block_rnn = True,
+        intra_block_rnn_kwargs: dict = dict(),
         rel_pos_bias = True,
         rel_pos_bias_kwargs: dict = dict()
     ):
         super().__init__()
 
-        assert not recurrent or block_size >= 1
-
+        assert block_size >= 1
         assert recurrent_mode in ('naive', 'tiled')
 
         self.recurrent = recurrent
@@ -504,6 +607,8 @@ class RecurrentTransformer(Module):
                 attn_gate = attn_gate,
                 gate_low_rank = gate_low_rank,
                 use_value_mlp = use_value_mlp,
+                use_intra_block_rnn = use_intra_block_rnn,
+                intra_block_rnn_kwargs = intra_block_rnn_kwargs,
                 rel_pos_bias = rel_pos_bias,
                 rel_pos_bias_kwargs = rel_pos_bias_kwargs
             )
@@ -528,16 +633,29 @@ class RecurrentTransformer(Module):
             LinearNoBias(dim, num_tokens)
         )
 
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @assert_shape({'ids': 'b n', 'labels': 'b n'})
     def forward(
         self,
         ids,
         return_loss = False,
         labels = None,
-        recurrent_mode = None
+        recurrent_mode = None,
+        memories = None,
+        return_memories = False
     ):
         recurrent_mode = default(recurrent_mode, self.recurrent_mode)
 
         assert recurrent_mode in ('naive', 'tiled')
+
+        # decoding with cached persistent key values is only possible under the naive recurrent mode
+
+        if exists(memories):
+            assert self.recurrent and recurrent_mode == 'naive', 'decoding requires recurrent = True and recurrent_mode = "naive"'
+            assert not return_loss
 
         if exists(labels):
             return_loss = True
@@ -551,21 +669,29 @@ class RecurrentTransformer(Module):
 
         # layers
 
-        for attn, ff in self.layers:
+        next_memories = []
 
-            forward_attn = attn
+        for layer_index, (attn, ff) in enumerate(self.layers):
+            memory = memories[layer_index] if exists(memories) else None
 
-            if self.recurrent and recurrent_mode == 'tiled':
-                forward_attn = attn.forward_tiled_recurrent
+            if self.recurrent and recurrent_mode == 'naive':
+                attn_out, next_memory = attn.forward_naive_recurrent(tokens, memory = memory, return_memory = True)
             elif self.recurrent:
-                forward_attn = attn.forward_naive_recurrent
+                attn_out, next_memory = attn.forward_tiled_recurrent(tokens, return_memory = True)
+            else:
+                attn_out, next_memory = attn(tokens), None
 
-            tokens = forward_attn(tokens) + tokens
+            next_memories.append(next_memory)
+
+            tokens = attn_out + tokens
             tokens = ff(tokens) + tokens
 
         # unembed
 
         logits = self.to_logits(tokens)
+
+        if return_memories:
+            return logits, next_memories
 
         if not return_loss:
             return logits
@@ -576,3 +702,44 @@ class RecurrentTransformer(Module):
         )
 
         return loss
+
+    @temp_eval
+    @torch.no_grad()
+    @assert_shape('... n')
+    def generate(
+        self,
+        prompt,
+        seq_len,
+        temperature = 1.,
+        filter_fn = top_k,
+        filter_kwargs = dict(frac_num_tokens = 0.1)
+    ):
+        assert self.recurrent, 'recurrent must be enabled to decode'
+
+        prompt, inverse_pack = pack_with_inverse(prompt, '* n')
+
+        prompt = prompt.to(self.device)
+
+        # prefill prompt, tiled by default
+
+        logits, memories = self.forward(prompt, return_memories = True)
+
+        # decode one token at a time, naive recurrent with persistent key value memories
+
+        out = []
+
+        for _ in range(seq_len):
+            filtered_logits = filter_fn(logits[:, -1], **filter_kwargs)
+            sampled = gumbel_sample(filtered_logits, temperature = temperature)
+            sampled = rearrange(sampled, 'b -> b 1')
+
+            out.append(sampled)
+
+            logits, memories = self.forward(
+                sampled,
+                recurrent_mode = 'naive',
+                memories = memories,
+                return_memories = True
+            )
+
+        return inverse_pack(cat(out, dim = -1))
