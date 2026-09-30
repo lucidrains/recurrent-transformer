@@ -12,7 +12,7 @@ from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import clamp, pack_with_inverse, pad_at_dim_to_multiple, temp_eval
-from torch_einops_utils.shape import assert_shape, shape
+from torch_einops_utils.shape import assert_shape, shape, size
 
 from x_mlps_pytorch import MLP
 
@@ -47,7 +47,7 @@ def gumbel_sample(t, temperature = 1., dim = -1, eps = 1e-10):
     return ((t / max(temperature, eps)) + gumbel_noise(t)).argmax(dim = dim)
 
 def top_k(logits, num_kept: int | None = None, frac_num_tokens = 0.1):
-    num_tokens = shape(logits, '... l').l
+    num_tokens = size(logits, '... [l]')
 
     num_kept = default(num_kept, ceil(frac_num_tokens * num_tokens))
 
@@ -76,7 +76,7 @@ class IntraBlockRNN(Module):
 
     def forward(self, tokens):
         block_size = self.block_size
-        batch = shape(tokens, 'b ...').b
+        batch = size(tokens, '[b] ...')
 
         # pad to multiple of block size
 
@@ -281,7 +281,7 @@ class Attention(Module):
 
         tokens, inverse_pad = pad_at_dim_to_multiple(tokens, block_size, dim = -2)
 
-        seq_len = shape(tokens, 'b n d').n
+        seq_len = size(tokens, 'b [n] d')
 
         residual = tokens
 
@@ -387,8 +387,7 @@ class Attention(Module):
             tile_sim = einsum(tq, tk, 'b h i d, b h j d -> b h i j') * self.scale
 
             if exists(self.rel_pos_bias):
-                q_tile_len, = shape(tq, 'b h [i] d')
-                kv_tile_len, = shape(tk, 'b h [j] d')
+                q_tile_len, kv_tile_len = shape(tile_sim, 'b h [i] [j]')
                 tile_sim = tile_sim + self.rel_pos_bias(q_tile_len, q_tile_len + kv_tile_len)[..., :kv_tile_len]
 
             tile_max = tile_sim.amax(dim = -1, keepdim = True)

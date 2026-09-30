@@ -1,6 +1,6 @@
 [project]
 name = "recurrent-transformer-pytorch"
-version = "0.0.11"
+version = "0.0.14"
 description = "Recurrent Transformer"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -27,7 +27,7 @@ dependencies = [
     "einx>=0.4.0",
     "einops>=0.8.1",
     "torch>=2.5",
-    "torch-einops-utils>=0.1.32",
+    "torch-einops-utils>=0.1.34",
     "x-mlps-pytorch>=0.6.0"
 ]
 
