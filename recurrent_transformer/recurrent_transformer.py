@@ -686,6 +686,47 @@ class RecurrentTransformer(Module):
     def device(self):
         return next(self.parameters()).device
 
+    @temp_eval
+    @torch.no_grad()
+    @assert_shape('... n')
+    def generate(
+        self,
+        prompt,
+        seq_len,
+        temperature = 1.,
+        filter_fn = top_k,
+        filter_kwargs = dict(frac_num_tokens = 0.1)
+    ):
+        assert self.recurrent, 'recurrent must be enabled to decode'
+
+        prompt, inverse_pack = pack_with_inverse(prompt, '* n')
+
+        prompt = prompt.to(self.device)
+
+        # prefill prompt, tiled by default
+
+        logits, memories = self.forward(prompt, return_memories = True)
+
+        # decode one token at a time, naive recurrent with persistent key value memories
+
+        out = []
+
+        for _ in range(seq_len):
+            filtered_logits = filter_fn(logits[:, -1], **filter_kwargs)
+            sampled = gumbel_sample(filtered_logits, temperature = temperature)
+            sampled = rearrange(sampled, 'b -> b 1')
+
+            out.append(sampled)
+
+            logits, memories = self.forward(
+                sampled,
+                recurrent_mode = 'naive',
+                memories = memories,
+                return_memories = True
+            )
+
+        return inverse_pack(cat(out, dim = -1))
+
     @assert_shape({'ids': 'b n', 'labels': 'b n'})
     def forward(
         self,
@@ -751,44 +792,3 @@ class RecurrentTransformer(Module):
         )
 
         return loss
-
-    @temp_eval
-    @torch.no_grad()
-    @assert_shape('... n')
-    def generate(
-        self,
-        prompt,
-        seq_len,
-        temperature = 1.,
-        filter_fn = top_k,
-        filter_kwargs = dict(frac_num_tokens = 0.1)
-    ):
-        assert self.recurrent, 'recurrent must be enabled to decode'
-
-        prompt, inverse_pack = pack_with_inverse(prompt, '* n')
-
-        prompt = prompt.to(self.device)
-
-        # prefill prompt, tiled by default
-
-        logits, memories = self.forward(prompt, return_memories = True)
-
-        # decode one token at a time, naive recurrent with persistent key value memories
-
-        out = []
-
-        for _ in range(seq_len):
-            filtered_logits = filter_fn(logits[:, -1], **filter_kwargs)
-            sampled = gumbel_sample(filtered_logits, temperature = temperature)
-            sampled = rearrange(sampled, 'b -> b 1')
-
-            out.append(sampled)
-
-            logits, memories = self.forward(
-                sampled,
-                recurrent_mode = 'naive',
-                memories = memories,
-                return_memories = True
-            )
-
-        return inverse_pack(cat(out, dim = -1))
