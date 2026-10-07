@@ -17,6 +17,8 @@ from torch_einops_utils.shape import assert_shape, shape, size
 
 from x_mlps_pytorch import MLP
 
+from recurrent_transformer.triton_flash_tiled import can_use_triton, tile_attn_update
+
 # einstein equations
 
 # b - batch
@@ -161,6 +163,15 @@ class RelativePositionBias(Module):
         if distance_basis:
             self.distance_bank = nn.Parameter(torch.randn(num_distance_basis, max_dist) * 0.02)
             self.to_head_weights = nn.Parameter(torch.zeros(heads, num_distance_basis))
+
+    def kernel_params(self):
+        slopes = self.to_alibi_slopes if self.learned_alibi else None
+
+        curves = None
+        if self.distance_basis:
+            curves = einsum(self.to_head_weights, self.distance_bank, 'h b, b r -> h r')
+
+        return slopes, curves, self.max_dist
 
     def forward(
         self,
@@ -326,6 +337,16 @@ class Attention(Module):
         q = self.process_queries(tokens)
         k, v = self.process_key_values(tokens)
 
+        # fused triton updates, when available
+
+        use_triton = can_use_triton(tokens)
+
+        slopes = curves = None
+        max_dist = 0
+
+        if use_triton and exists(self.rel_pos_bias):
+            slopes, curves, max_dist = self.rel_pos_bias.kernel_params()
+
         # the queries and temporary keys and values can be processed all at once for the initial partial online row outputs, causal within each block
 
         q_blk = rearrange(q, 'b h (n s) d -> b h n s d', s = block_size)
@@ -422,36 +443,45 @@ class Attention(Module):
             tk = cat(persist_ks[kv_tile_slice], dim = -2)
             tv = cat(persist_vs[kv_tile_slice], dim = -2)
 
-            # calculate tile
-
-            tile_sim = einsum(tq, tk, 'b h i d, b h j d -> b h i j') * self.scale
-
-            if exists(self.rel_pos_bias):
-                q_tile_len, kv_tile_len = shape(tile_sim, 'b h [i] [j]')
-                tile_sim = tile_sim + self.rel_pos_bias(q_tile_len, q_tile_len + kv_tile_len)[..., :kv_tile_len]
-
-            tile_max = tile_sim.amax(dim = -1, keepdim = True)
-
             # clone the old partials
 
             old_row_max = row_max[..., q_tile_slice, :].clone()
             old_row_sums = row_sums[..., q_tile_slice, :].clone()
             old_row_nums = row_nums[..., q_tile_slice, :].clone()
 
-            next_row_max = torch.maximum(old_row_max, tile_max)
+            # fused online softmax tile update, or the naive fallback
 
-            tile_sim_exp = (tile_sim - next_row_max).exp()
+            if use_triton:
+                next_row_max, next_row_sums, next_row_nums = tile_attn_update(
+                    tq, tk, tv,
+                    old_row_max, old_row_sums, old_row_nums,
+                    scale = self.scale,
+                    q_offset = q_tile_slice.start,
+                    kv_offset = kv_tile_slice.start * block_size,
+                    slopes = slopes,
+                    curves = curves,
+                    max_dist = max_dist
+                )
+            else:
+                tile_sim = einsum(tq, tk, 'b h i d, b h j d -> b h i j') * self.scale
 
-            tile_num = einsum(tile_sim_exp, tv, 'b h i j, b h j d -> b h i d')
+                if exists(self.rel_pos_bias):
+                    q_tile_len, kv_tile_len = shape(tile_sim, 'b h [i] [j]')
+                    tile_sim = tile_sim + self.rel_pos_bias(q_tile_len, q_tile_len + kv_tile_len)[..., :kv_tile_len]
 
-            tile_sums = tile_sim_exp.sum(dim = -1, keepdim = True)
+                tile_max = tile_sim.amax(dim = -1, keepdim = True)
+                next_row_max = torch.maximum(old_row_max, tile_max)
+
+                tile_sim_exp = (tile_sim - next_row_max).exp()
+                renorm = (old_row_max - next_row_max).exp()
+
+                next_row_nums = einsum(tile_sim_exp, tv, 'b h i j, b h j d -> b h i d') + old_row_nums * renorm
+                next_row_sums = tile_sim_exp.sum(dim = -1, keepdim = True) + old_row_sums * renorm
 
             # update partials in place, as the tile of queries is a contiguous slice
 
-            renorm = (old_row_max - next_row_max).exp()
-
-            row_sums[..., q_tile_slice, :] = old_row_sums * renorm + tile_sums
-            row_nums[..., q_tile_slice, :] = old_row_nums * renorm + tile_num
+            row_sums[..., q_tile_slice, :] = next_row_sums
+            row_nums[..., q_tile_slice, :] = next_row_nums
             row_max[..., q_tile_slice, :] = next_row_max
 
         # return

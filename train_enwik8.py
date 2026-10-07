@@ -22,6 +22,8 @@ from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
 
 from recurrent_transformer import RecurrentTransformer
+from recurrent_transformer import triton_flash_tiled
+from recurrent_transformer.triton_flash_tiled import triton_available
 
 # helpers
 
@@ -66,8 +68,8 @@ class TextSamplerDataset(Dataset):
 def train(
     num_batches: int = 10_000,
     batch_size: int = 4,
-    grad_accum_every: int = 2,
-    learning_rate: float = 1e-3,
+    grad_accum_every: int = 4,
+    learning_rate: float = 3e-4,
     validate_every: int = 100,
     generate_every: int = 100,
     prime_length: int = 32,
@@ -79,9 +81,16 @@ def train(
     filter_thres: float = 0.9,
     temperature: float = 1.,
     cpu: bool = False,
+    cuda: bool = False,
+    triton: bool = True,
     data_path: str = "./data/enwik8.gz"
 ):
-    accelerator = Accelerator(cpu = cpu)
+    triton_flash_tiled.TRITON_ENABLED = triton
+
+    accelerator = Accelerator(cpu = cpu and not cuda)
+
+    fused_triton = accelerator.device.type == 'cuda' and triton_available()
+    accelerator.print(f'fused triton tiled attention: {fused_triton}')
 
     # prepare enwik8 data
 
