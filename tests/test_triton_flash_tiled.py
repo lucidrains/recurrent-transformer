@@ -66,7 +66,7 @@ def get_model(block_size, transition_kind, rel_pos_bias_kwargs = dict()):
     )
 
 @param('causal', (False, True))
-@param('bias_kind', ('none', 'both'))
+@param('bias_kind', ('none', 'alibi', 'curves', 'both'))
 def test_tile_attention_update_matches_reference(causal, bias_kind):
     torch.manual_seed(0)
 
@@ -87,7 +87,7 @@ def test_tile_attention_update_matches_reference(causal, bias_kind):
         slopes = (torch.randn(heads, device = 'cuda') * 0.1).requires_grad_()
 
     if bias_kind in ('curves', 'both'):
-        max_dist = 32
+        max_dist = 12
         curves = torch.randn(heads, max_dist, device = 'cuda', requires_grad = True)
 
     q_offset = seq_len + 3 if causal else seq_len
@@ -159,7 +159,7 @@ def test_triton_tiled_matches_cpu_pathway(block_size):
 def test_triton_tiled_matches_naive_pathway(block_size):
     torch.manual_seed(42)
 
-    model = get_model(block_size, 'gru', dict(learned_alibi = True, distance_basis = True)).cuda()
+    model = get_model(block_size, 'gru', dict(learned_alibi = True, distance_basis = True, max_dist = 4)).cuda()
     ids = torch.randint(0, 64, (2, 8), device = 'cuda')
 
     naive_loss = model(ids, return_loss = True, recurrent_mode = 'naive')

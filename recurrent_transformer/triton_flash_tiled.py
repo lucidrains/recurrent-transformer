@@ -41,6 +41,16 @@ if TRITON_AVAILABLE:
     NEG_INF = tl.constexpr(float("-inf"))
 
     @triton.jit
+    def _alibi_dist(dist, max_dist, HAS_CURVES: tl.constexpr):
+        # alibi distance weight, zero once outside the learned curve window
+        alibi_dist = tl.maximum(dist, 0).to(tl.float32)
+
+        if HAS_CURVES:
+            alibi_dist = tl.where(dist < max_dist, alibi_dist, 0.0)
+
+        return alibi_dist
+
+    @triton.jit
     def _tile_logits(
         q, k_tile, q_pos, kv_pos, mask_n,
         slope, max_dist, CURVES, h, scale,
@@ -73,7 +83,7 @@ if TRITON_AVAILABLE:
                 bias += tl.load(CURVES + h * max_dist + cdist, mask = bias_valid, other = 0.0)
 
             if HAS_ALIBI:
-                bias -= slope * tl.maximum(dist, 0).to(tl.float32)
+                bias -= slope * _alibi_dist(dist, max_dist, HAS_CURVES)
 
             sim = sim + tl.where(bias_valid, bias, 0.0)
 
@@ -278,7 +288,7 @@ if TRITON_AVAILABLE:
             # relative positional bias parameter gradients
 
             if HAS_ALIBI:
-                dslope = -tl.sum(tl.sum(d_sim * tl.maximum(dist, 0).to(tl.float32), axis = 1), axis = 0)
+                dslope = -tl.sum(d_sim * _alibi_dist(dist, max_dist, HAS_CURVES))
                 tl.atomic_add(DSLOPES + h, dslope)
 
             if HAS_CURVES:
@@ -310,7 +320,7 @@ if TRITON_AVAILABLE:
             dist_argmax = q_pos - (kv_offset + argmax_index)
 
             if HAS_ALIBI:
-                dslope = -tl.sum(tl.where(argmax_mask, d_m_tile * tl.maximum(dist_argmax, 0).to(tl.float32), 0.0), axis = 0)
+                dslope = -tl.sum(tl.where(argmax_mask, d_m_tile * _alibi_dist(dist_argmax, max_dist, HAS_CURVES), 0.0), axis = 0)
                 tl.atomic_add(DSLOPES + h, dslope)
 
             if HAS_CURVES:
